@@ -1,0 +1,491 @@
+# grid_pcg_env.py
+# Python 3.8+, Gymnasium API
+from __future__ import annotations
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+from collections import deque
+
+# ---- Tile IDs ----
+EMPTY, WALL, ROBOT, OBJECT, GOAL = 0, 1, 2, 3, 4
+TILES = (EMPTY, WALL, ROBOT, OBJECT, GOAL)
+N_TILES = len(TILES)
+
+# ---- BFS on 4-connected grid, walls are blocked ----
+def shortest_path_len(grid: np.ndarray, start, goal) -> int | None:
+    H, W = grid.shape
+    (sy, sx), (gy, gx) = start, goal
+    if (sy, sx) == (gy, gx):
+        return 0
+    seen = np.zeros_like(grid, dtype=bool)
+    q = deque()
+    q.append((sy, sx, 0))
+    seen[sy, sx] = True
+    while q:
+        y, x, d = q.popleft()
+        for dy, dx in ((1,0),(-1,0),(0,1),(0,-1)):
+            ny, nx = y+dy, x+dx
+            if ny < 0 or ny >= H or nx < 0 or nx >= W:
+                continue
+            if seen[ny, nx]:
+                continue
+            if grid[ny, nx] == WALL:
+                continue
+            if (ny, nx) == (gy, gx):
+                return d + 1
+            seen[ny, nx] = True
+            q.append((ny, nx, d+1))
+    return None
+
+
+class GridPCGEnv(gym.Env):
+    """
+    SeGMaN-style PCG environment.
+
+    - No SUBMIT: episodes last exactly `max_steps`.
+    - Unique entities with "move semantics": placing ROBOT/OBJECT/GOAL moves (or creates) that entity.
+    - WALL cannot overwrite an entity.
+    - Final reward at episode end (solvability + shaping), plus small per-step shaping.
+    - Observation: H x W x 5 (one-hot planes for [EMPTY, WALL, ROBOT, OBJECT, GOAL]).
+    - Action: Discrete(H * W * 5): (y, x, tile_type).
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+            self,
+            size: int = 13,
+            max_steps: int = 192,         # give enough action budget to place walls
+            seed: int | None = None,
+            use_curriculum: bool = True,  # 0-2 entities pre-placed at reset
+            wall_target: float = 0.25,    # target wall ratio
+    ):
+        super().__init__()
+        self.h = int(size)
+        self.w = int(size)
+        self.size = int(size)
+        self.max_steps = int(max_steps)
+        self.use_curriculum = bool(use_curriculum)
+        self.wall_target = float(wall_target)
+
+        self.steps = 0
+        self.rng = np.random.RandomState(seed if seed is not None else 42)
+
+        # -------- reward hyperparams (tuned for stability) --------
+        self.alpha = 0.06       # weight on L1+L2 (path lengths)
+        self.beta = 0.40       # wall-density penalty weight (terminal)
+        self.gamma = 2.0        # adjacency (trivial) penalty
+        self.delta = 0.5        # border penalty weight (terminal)
+
+        # corridor / structure shaping
+        self.lambda_corridor_term = 1.5    # terminal connectedness reward
+        self.lambda_corridor_step = 0.25   # tiny incremental reward for more adjacency per wall
+        self.lambda_isolated_term = 0.9    # terminal penalty for isolated walls
+        self.lambda_block_term = 0.3    # terminal penalty for 2x2 wall blocks
+
+        # per-step coax toward "some walls" after all 3 entities exist
+        self.wall_step_coax = 0.06
+        # useful band for final wall ratio bonus
+        self._wall_band_lo = 0.20
+        self._wall_band_hi = 0.50
+        # grid
+        self.grid = np.full((self.h, self.w), EMPTY, dtype=np.int32)
+
+        # spaces
+        self.observation_space = spaces.Box(
+            low=0.0, high=1.0, shape=(self.h, self.w, N_TILES), dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(self.h * self.w * N_TILES)
+
+        # small per-step costs/bonuses
+        self.step_cost = 0.0002
+        self.first_valid_bonus = 0.15
+        self._was_valid = False
+
+    # ---------- helpers ----------
+    def _obs(self) -> np.ndarray:
+        planes = np.zeros((self.h, self.w, N_TILES), dtype=np.float32)
+        for t in TILES:
+            planes[:, :, t] = (self.grid == t)
+        return planes
+
+    def _count(self, t: int) -> int:
+        return int(np.sum(self.grid == t))
+
+    def _pos(self, t: int):
+        ys, xs = np.where(self.grid == t)
+        if ys.size == 0:
+            return None
+        return int(ys[0]), int(xs[0])
+
+    def _place_unique(self, t: int, y: int, x: int):
+        assert t in (ROBOT, OBJECT, GOAL)
+        cur = self._pos(t)
+        if cur is not None:
+            cy, cx = cur
+            self.grid[cy, cx] = EMPTY
+        self.grid[y, x] = t
+
+    def _seed_small_segment(self, length: int):
+        y = int(self.rng.randint(1, self.h - 1))
+        x = int(self.rng.randint(1, self.w - 1))
+        if self.rng.rand() < 0.5:
+            # horizontal
+            for k in range(length):
+                xx = x + k
+                if 0 < xx < self.w - 1 and self.grid[y, xx] not in (ROBOT, OBJECT, GOAL):
+                    self.grid[y, xx] = WALL
+        else:
+            # vertical
+            for k in range(length):
+                yy = y + k
+                if 0 < yy < self.h - 1 and self.grid[yy, x] not in (ROBOT, OBJECT, GOAL):
+                    self.grid[yy, x] = WALL
+
+    def _seed_walls_bootstrap(self):
+        # 70% chance to pre-seed 1–3 short segments (length 2–4)
+        if self.rng.rand() < 0.7:
+            n = int(self.rng.randint(1, 4))
+            for _ in range(n):
+                L = int(self.rng.randint(2, 5))
+                self._seed_small_segment(L)
+
+    def _valid_final(self) -> bool:
+        return (self._count(ROBOT) == 1 and
+                self._count(OBJECT) == 1 and
+                self._count(GOAL) == 1)
+
+    def _border_penalty(self, margin: int = 1) -> float:
+        pen = 0.0
+        H, W = self.h, self.w
+        for t in (ROBOT, OBJECT, GOAL):
+            p = self._pos(t)
+            if p is None:
+                continue
+            y, x = p
+            if y <= margin or y >= H - 1 - margin or x <= margin or x >= W - 1 - margin:
+                pen += 1.0
+        return pen
+
+    def _wall_stats(self):
+        g = (self.grid == WALL).astype(np.int32)
+        n_walls = int(g.sum())
+        if n_walls == 0:
+            return dict(n_walls=0, ratio=0.0, n_isolated=0, n_adj_pairs=0, n_2x2=0)
+
+        # 4-neighborhood adjacency
+        up = g[:-1, :] * g[1:, :]
+        left = g[:, :-1] * g[:, 1:]
+        n_adj_pairs = int(up.sum() + left.sum())
+
+        deg = np.zeros_like(g, dtype=np.int32)
+        deg[1:,  :] += g[:-1, :]
+        deg[:-1, :] += g[1:,  :]
+        deg[:, 1:]  += g[:, :-1]
+        deg[:, :-1] += g[:, 1:]
+        n_isolated = int(((g == 1) & (deg == 0)).sum())
+
+        n_2x2 = int((g[:-1, :-1] * g[1:, :-1] * g[:-1, 1:] * g[1:, 1:]).sum())
+        ratio = n_walls / float(self.h * self.w)
+
+        return dict(
+            n_walls=n_walls, ratio=ratio,
+            n_isolated=n_isolated, n_adj_pairs=n_adj_pairs, n_2x2=n_2x2
+        )
+
+    def _free_space_components(self):
+        H, W = self.h, self.w
+        blocked = (self.grid == WALL)
+        seen = np.zeros((H, W), dtype=bool)
+        comps = 0
+        for y in range(H):
+            for x in range(W):
+                if blocked[y, x] or seen[y, x]:
+                    continue
+                comps += 1
+                q = [(y, x)]
+                seen[y, x] = True
+                while q:
+                    cy, cx = q.pop()
+                    for dy, dx in ((1,0),(-1,0),(0,1),(0,-1)):
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < H and 0 <= nx < W and not blocked[ny, nx] and not seen[ny, nx]:
+                            seen[ny, nx] = True
+                            q.append((ny, nx))
+        return comps
+
+    # ---------- terminal score ----------
+    def _evaluate_grid(self):
+        wall_ratio_observed = float(np.mean(self.grid == WALL))
+        metrics = {
+            "valid": 0, "L1": 0, "L2": 0,
+            "wall_ratio": wall_ratio_observed,
+            "adj_per_wall": 0.0,
+            "iso_frac": 0.0
+        }
+
+        if not self._valid_final():
+            return -1.0, metrics
+
+        ry, rx = self._pos(ROBOT)
+        oy, ox = self._pos(OBJECT)
+        gy, gx = self._pos(GOAL)
+
+        L1 = shortest_path_len(self.grid, (ry, rx), (oy, ox))
+        if L1 is None:
+            return -0.5, metrics
+        L2 = shortest_path_len(self.grid, (oy, ox), (gy, gx))
+        if L2 is None:
+            return -0.5, metrics
+
+        # trivial adjacency (touching)
+        adj_trivial = 0.0
+        if max(abs(ry - oy), abs(rx - ox)) <= 1:
+            adj_trivial = 1.0
+        if max(abs(oy - gy), abs(ox - gx)) <= 1:
+            adj_trivial = 1.0
+
+        # wall target penalty, curved
+        ws = self._wall_stats()
+        wr = ws["ratio"]
+        wall_dev = abs(wr - self.wall_target)
+
+        # small bonus if we land inside the [0.18, 0.32] band
+        band_bonus = 0.5 if (self._wall_band_lo <= wr <= self._wall_band_hi) else -0.5
+
+        # curved penalty away from target (keeps learning pressure outside band)
+        wall_term = band_bonus - self.beta * (wall_dev ** 1.5) * 2.0
+
+        # corridor quality
+        if ws["n_walls"] > 0:
+            adj_per_wall = ws["n_adj_pairs"] / float(ws["n_walls"])
+            iso_frac = ws["n_isolated"] / float(ws["n_walls"])
+        else:
+            adj_per_wall, iso_frac = 0.0, 0.0
+
+        corridor_term = (
+                + self.lambda_corridor_term * adj_per_wall
+                - self.lambda_isolated_term * iso_frac
+                - self.lambda_block_term * (ws["n_2x2"] / max(1, ws["n_walls"]))
+        )
+
+        border_pen = self._border_penalty(margin=1)
+        free_comps = self._free_space_components()
+        free_space_pen = 0.15 * max(0, free_comps - 1)
+
+        R = (0.5
+             + self.alpha * (L1 + L2)
+             + wall_term
+             + corridor_term
+             - self.gamma * adj_trivial
+             - self.delta * border_pen
+             - free_space_pen)
+        if ws["n_walls"] == 0:
+            R -= 0.5  # endings with zero walls should be clearly worse
+        metrics.update({
+            "valid": 1, "L1": int(L1), "L2": int(L2),
+            "wall_ratio": wr,
+            "adj_per_wall": adj_per_wall,
+            "iso_frac": iso_frac
+        })
+        return float(R), metrics
+
+    # ---------- Gymnasium API ----------
+    def reset(self, *, seed: int | None = None, options=None):
+        if seed is not None:
+            self.rng.seed(seed)
+        self.steps = 0
+        self.grid.fill(EMPTY)
+
+        # tiny curriculum: start with 0–2 entities already placed
+        if self.use_curriculum:
+            k = int(self.rng.randint(0, 3))  # 0, 1, or 2
+            pool = [ROBOT, OBJECT, GOAL]
+            self.rng.shuffle(pool)
+            used = set()
+            for t in pool[:k]:
+                while True:
+                    y = int(self.rng.randint(self.h))
+                    x = int(self.rng.randint(self.w))
+                    if (y, x) not in used and self.grid[y, x] == EMPTY:
+                        used.add((y, x))
+                        break
+                self._place_unique(t, y, x)
+        self._seed_walls_bootstrap()
+        self._was_valid = self._valid_final()
+        return self._obs(), {}
+
+    def step(self, action: int):
+        idx = int(action) // N_TILES
+        t = int(action) % N_TILES
+        y, x = divmod(idx, self.w)
+
+        reward = 0.0
+
+        def manhattan(a, b):
+            (ay, ax), (by, bx) = a, b
+            return abs(ay - by) + abs(ax - bx)
+
+        def spread_total():
+            r = self._pos(ROBOT); o = self._pos(OBJECT); g = self._pos(GOAL)
+            if (r is None) or (o is None) or (g is None):
+                return None
+            return manhattan(r, o) + manhattan(o, g)
+
+        def path_total():
+            r = self._pos(ROBOT); o = self._pos(OBJECT); g = self._pos(GOAL)
+            if (r is None) or (o is None) or (g is None):
+                return None
+            L1 = shortest_path_len(self.grid, r, o)
+            L2 = shortest_path_len(self.grid, o, g)
+            if L1 is None or L2 is None:
+                return 0
+            return L1 + L2
+
+        prev_grid = self.grid.copy()
+        had_R = self._count(ROBOT) > 0
+        had_O = self._count(OBJECT) > 0
+        had_G = self._count(GOAL)  > 0
+        prev_valid = self._valid_final()
+        prev_total = path_total()
+        prev_spread = spread_total()
+
+        prev_stats = self._wall_stats()
+        prev_adj_per_wall = (prev_stats["n_adj_pairs"] / float(prev_stats["n_walls"])
+                             if prev_stats["n_walls"] > 0 else 0.0)
+        prev_iso_frac = (prev_stats["n_isolated"] / float(prev_stats["n_walls"])
+                         if prev_stats["n_walls"] > 0 else 0.0)
+
+        # apply edit
+        if t in (ROBOT, OBJECT, GOAL):
+            cur = self._pos(t)
+            if cur == (y, x):
+                reward -= 0.05
+            else:
+                self._place_unique(t, y, x)
+        elif t == WALL:
+            if self.grid[y, x] in (ROBOT, OBJECT, GOAL):
+                reward -= 0.02
+            elif self.grid[y, x] == WALL:
+                reward -= 0.01
+            else:
+                self.grid[y, x] = WALL
+        else:  # EMPTY
+            if self.grid[y, x] == EMPTY:
+                reward -= 0.01
+            else:
+                self.grid[y, x] = EMPTY
+
+        changed = not np.array_equal(prev_grid, self.grid)
+        if not changed:
+            reward -= 0.02
+        else:
+            if t == WALL and self.grid[y, x] == WALL:
+                # neighbors
+                H, W = self.h, self.w
+                g = (self.grid == WALL).astype(np.int32)
+
+                # count 4-neigh walls around (y,x)
+                deg = 0
+                for dy, dx in ((1,0),(-1,0),(0,1),(0,-1)):
+                    ny, nx = y+dy, x+dx
+                    if 0 <= ny < H and 0 <= nx < W and g[ny, nx]:
+                        deg += 1
+
+                # favor corridor-like attachments (one or two neighbors, esp straight lines)
+                if deg == 1:
+                    reward += 0.03                 # start/extend a chain
+                elif deg == 2:
+                    # check if it's a straight segment (up-down XOR left-right)
+                    straight = (0 < y < H-1 and g[y-1, x] and g[y+1, x]) or (0 < x < W-1 and g[y, x-1] and g[y, x+1])
+                    reward += 0.035 if straight else 0.02
+
+                # discourage isolated pixels and 2x2 blocks
+                if deg == 0:
+                    reward -= 0.03                 # isolated single wall is bad
+                # 2x2 blob check (any of the four quarters)
+                makes_2x2 = (
+                        (y > 0 and x > 0 and g[y-1, x] and g[y, x-1] and g[y-1, x-1]) or
+                        (y > 0 and x < W-1 and g[y-1, x] and g[y, x+1] and g[y-1, x+1]) or
+                        (y < H-1 and x > 0 and g[y+1, x] and g[y, x-1] and g[y+1, x-1]) or
+                        (y < H-1 and x < W-1 and g[y+1, x] and g[y, x+1] and g[y+1, x+1])
+                )
+                if makes_2x2:
+                    reward -= 0.03
+                reward += 0.03  # was 0.01
+            # discourage deleting walls without reason (WALL -> EMPTY)
+            if t == EMPTY and prev_grid[y, x] == WALL and self.grid[y, x] == EMPTY:
+                reward -= 0.03
+
+        # new-entity one-time bonuses (no farming)
+        new_had_R = self._count(ROBOT) > 0
+        new_had_O = self._count(OBJECT) > 0
+        new_had_G = self._count(GOAL)  > 0
+        if new_had_R and not had_R: reward += 0.25
+        if new_had_O and not had_O: reward += 0.25
+        if new_had_G and not had_G: reward += 0.25
+
+        # coax toward some walls once valid
+        now_valid = self._valid_final()
+        if now_valid:
+            wr = float(np.mean(self.grid == WALL))
+            reward += self.wall_step_coax * min(wr / self.wall_target, 1.0)
+            if t in (ROBOT, GOAL, OBJECT):
+                reward -= 0.02
+
+        # potential on L1+L2 and spread
+        new_total = path_total()
+        if prev_total is not None and new_total is not None:
+            if new_total > prev_total:
+                reward += 0.05
+            elif new_total < prev_total:
+                reward -= 0.02
+
+        new_spread = spread_total()
+        if prev_spread is not None and new_spread is not None:
+            if new_spread > prev_spread:
+                reward += 0.03
+            elif new_spread < prev_spread:
+                reward -= 0.01
+
+        if (not prev_valid) and now_valid:
+            reward += self.first_valid_bonus
+        self._was_valid = now_valid
+
+        # incremental corridor shaping
+        new_stats = self._wall_stats()
+        if new_stats["n_walls"] > 0:
+            new_adj_per_wall = new_stats["n_adj_pairs"] / float(new_stats["n_walls"])
+            new_iso_frac = new_stats["n_isolated"] / float(new_stats["n_walls"])
+            if new_adj_per_wall > prev_adj_per_wall:
+                reward += self.lambda_corridor_step
+            elif new_adj_per_wall < prev_adj_per_wall:
+                reward -= 0.5 * self.lambda_corridor_step
+            if new_iso_frac > prev_iso_frac:
+                reward -= 0.5 * self.lambda_corridor_step
+
+        reward -= self.step_cost
+
+        # step / done
+        self.steps += 1
+        terminated = (self.steps >= self.max_steps)
+        truncated = False
+        info = {}
+
+        if terminated:
+            if not self._valid_final():
+                wr = float(np.mean(self.grid == WALL))
+                reward += -2.0
+                info = {"valid": 0, "L1": 0, "L2": 0, "wall_ratio": wr, "final_grid": self.grid.copy()}
+            else:
+                r_eval, metrics = self._evaluate_grid()
+                reward += r_eval
+                metrics["final_grid"] = self.grid.copy()
+                info = metrics
+
+        return self._obs(), float(reward), terminated, truncated, info
+
+    def render(self):
+        chars = {EMPTY: ".", WALL: "#", ROBOT: "R", OBJECT: "O", GOAL: "G"}
+        print("\n".join("".join(chars[int(self.grid[y, x])] for x in range(self.w)) for y in range(self.h)))

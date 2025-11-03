@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+.env
+*.ipynb_checkpoints
+
+# OS/editor
+.DS_Store
+*.swp
+.idea
+.vscode/*
+
+# Large raw artifacts (safety net)
+# --- PUT GENERAL IGNORES FIRST ---
+*.zip
+*.npy
+*.npz
+*.pt
+*.pth
+*.png
+
+# Training outputs & logs
+# --- IGNORE CONTENTS, NOT THE FOLDER ---
+# This lets the !-rules below work
+runs/*
+eval_*/
+
+# --- WHITELIST SPECIFIC FILES (EXCEPTIONS) ---
+# The leading / anchors this to the root directory
+!/montage_stoch.png
+!runs/ppo_grid_corridors_v3/ppo_grid_nomask_final.zip
+!runs/ppo_grid_corridors_v3/best_model.zip
+!runs/ppo_grid_corridors_v3/ppo_ckpt_404800_steps.zip
+!runs/ppo_grid_corridors_v3/ppo_ckpt_1011008_steps.zip
