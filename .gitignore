@@ -11,7 +11,7 @@ __pycache__/
 .DS_Store
 *.swp
 .idea
-.vscode/*
+.vscode/
 
 # Large raw artifacts (safety net)
 # --- PUT GENERAL IGNORES FIRST ---
@@ -24,13 +24,22 @@ __pycache__/
 
 # Training outputs & logs
 # --- IGNORE CONTENTS, NOT THE FOLDER ---
-# This lets the !-rules below work
 runs/*
 eval_*/
-!eval_v3_stoch/keepers/*.png
+
+# --- RULES TO WHITELIST keepers/ FOLDER ---
+!eval_v3_stoch/
+eval_v3_stoch/*
+!eval_v3_stoch/keepers/
+
+# --- RULES TO WHITELIST model .zip FILES ---
+!runs/ppo_grid_corridors_v3/
+runs/ppo_grid_corridors_v3/*
+
 # --- WHITELIST SPECIFIC FILES (EXCEPTIONS) ---
 # The leading / anchors this to the root directory
 !/montage_stoch.png
+!eval_v3_stoch/keepers/*.png
 !runs/ppo_grid_corridors_v3/ppo_grid_nomask_final.zip
 !runs/ppo_grid_corridors_v3/best_model.zip
 !runs/ppo_grid_corridors_v3/ppo_ckpt_404800_steps.zip
