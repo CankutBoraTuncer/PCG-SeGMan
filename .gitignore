@@ -27,7 +27,7 @@ __pycache__/
 # This lets the !-rules below work
 runs/*
 eval_*/
-
+!eval_v3_stoch/keepers/*.png
 # --- WHITELIST SPECIFIC FILES (EXCEPTIONS) ---
 # The leading / anchors this to the root directory
 !/montage_stoch.png
