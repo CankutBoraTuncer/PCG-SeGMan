@@ -7,6 +7,9 @@ The agent learns to construct solvable levels with meaningful corridor-like wall
 - Requires Python 3.8 (Higher versions haven't been tested, but can work.)
 ----------
 ## 🧩 Overview
+<table><tr><td><img src="/eval_v3_stoch/keepers/ep_00616.png" width="200" height="200"></td><td><img src="/eval_v3_stoch/keepers/ep_00852.png" width="200" height="200"></td><td><img src="/eval_v3_stoch/keepers/ep_01504.png" width="200" height="200"></td></tr></table>
+<img src="/montage_stoch.png" width="600" height="600">
+
 
 This project explores **Procedural Content Generation via Reinforcement Learning (PCGRL)** on a minimal **Grid-based Level Generation** task inspired by SeGMaN’s compositional planning ideas.
 
