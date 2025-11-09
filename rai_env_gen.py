@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-montage_sample.py — visualize final grids from the SUBMIT-less PCG env (no masking).
+rai_env_gen.py — Generate PCG environments and save as rai Config files
 
 Usage
 -----
-python montage_sample.py --model runs/ppo_grid_nomask/ppo_grid_nomask_final.zip \
-  --n 16 --size 13 --max_steps 48 --out montage.png --deterministic
-
-Optional:
-  --save_npy samples.npy     # also save raw integer grids (n, H, W)
+python3 rai_env_gen.py --n 16 --size 13 --max_steps 1024 --stochastic
 """
 import argparse
 import math
@@ -132,15 +128,12 @@ def rollout_one(env: DummyVecEnv, model: PPO, max_steps: int, deterministic: boo
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, required=True, help="Path to PPO .zip")
     ap.add_argument("--n", type=int, default=16, help="Number of samples")
     ap.add_argument("--size", type=int, default=13)
     ap.add_argument("--max_steps", type=int, default=48)
     ap.add_argument("--seed", type=int, default=12345)
-    ap.add_argument("--out", type=str, default="montage.png")
     ap.add_argument("--deterministic", action="store_true", help="Greedy actions")
     ap.add_argument("--stochastic", action="store_true", help="Sample actions (overrides --deterministic)")
-    ap.add_argument("--save_npy", type=str, default="", help="Optional path to save raw grids as .npy")
     args = ap.parse_args()
 
     deterministic = args.deterministic and not args.stochastic
@@ -149,7 +142,8 @@ def main():
     env = DummyVecEnv([make_env(args.size, args.max_steps, args.seed)])
 
     # Load PPO model with env attached (avoids n_envs mismatch issues)
-    model = PPO.load(args.model, env=env, device="auto")
+    model = "runs/ppo_grid_corridors_v3/ppo_grid_nomask_final"
+    model = PPO.load(model, env=env, device="auto")
 
     fn = random.randint(0, 100)
     os.makedirs(f"ry_config/case_run_id_{fn}", exist_ok=True)
