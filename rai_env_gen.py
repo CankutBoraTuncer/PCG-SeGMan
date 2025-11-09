@@ -13,6 +13,7 @@ Optional:
 import argparse
 import math
 import os
+import random
 from typing import Any, Tuple, Sequence
 
 import numpy as np
@@ -150,6 +151,9 @@ def main():
     # Load PPO model with env attached (avoids n_envs mismatch issues)
     model = PPO.load(args.model, env=env, device="auto")
 
+    fn = random.randint(0, 100)
+    os.makedirs(f"ry_config/case_run_id_{fn}", exist_ok=True)
+
     # Roll out n episodes
     for i in range(args.n):
         print(f"Rolling out sample {i+1}/{args.n}...")
@@ -161,29 +165,59 @@ def main():
         ob_s = (env_size-wall_thickness)/float(args.size)
         sx = -(env_size/2) + ob_s / 2 + .05
         sy = (env_size/2) - ob_s / 2 - .05
-        print(sy, sx)
+
         if valid:
             C = ry.Config()
-            C.addFile('ry_config/base-walls-min.g')
+            C_aux = ry.Config()
+            C.addFile('ry_config/base.g')
+            C_aux.addFile('ry_config/base-aux.g')
             for r in range(g.shape[0]):
                 for c in range(g.shape[1]):
-                    
+
                     if g[r, c] == WALL:
                         f = C.addFrame(f"block_{r}_{c}", "world", f"shape:ssBox, size:[{ob_s}, {ob_s}, 0.2, 0.01], color:[0.6953, 0.515625, 0.453125], contact:1")
                         f.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.1])
+
+                        f_aux = C_aux.addFrame(f"block_{r}_{c}", "world", f"shape:ssBox, size:[{ob_s}, {ob_s}, 0.2, 0.01], color:[1 0 0], contact:1")
+                        f_aux.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.1])
 
                     elif g[r, c] == ROBOT:
                         f = C.frame("ego").setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.0])
                         f.setShape(ry.ST.ssCylinder, size=[.2, ob_s*.45, .02])
 
+                        f_aux = C_aux.frame("ego").setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.0])
+
                     elif g[r, c] == OBJECT:
-                        f = C.addFrame(f"obj1", "world", f"shape:ssBox, size:[{ob_s*.6}, {ob_s*.6}, 0.1, 0.01], color:[0 0 1], contact:1, logical:{'{movable_go}'}")
-                        f.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.05])
+
+                        f = C.addFrame("obj1Joint", "world")
+                        f.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.1])
+                        C.addFrame(f"obj1", "obj1Joint", f"shape:ssBox, size:[{ob_s*.6}, {ob_s*.6}, 0.2, 0.01], color:[0 0 1], contact:1, joint:rigid, logical:{'{movable_go}'}")
+
+                        f_aux = C_aux.addFrame("obj1Joint", "world")
+                        f_aux.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.1])
+                        C_aux.addFrame(f"obj1", "obj1Joint", f"shape:ssBox, size:[{ob_s*.6}, {ob_s*.6}, 0.2, 0.01], color:[0 0 1], contact:1, logical:{'{movable_go}'}")
+                        C_aux.addFrame("obj1_cam", "obj1", f"Q:'t(0 0 7) d(180 1 0 0)' shape:camera, width:300, height:300")
 
                     elif g[r, c] == GOAL:
-                        f = C.addFrame(f"goal1", "world", f"shape:ssBox, size:[{ob_s*.6}, {ob_s*.6}, 0.1, 0.01], color:[0 0 1 .3], contact:0, logical{'{goal}'}")
-                        f.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.05])
+                        f = C.addFrame(f"goal1", "world", f"shape:ssBox, size:[{ob_s*.6}, {ob_s*.6}, 0.2, 0.01], color:[0 0 1 .3], contact:0, logical{'{goal}'}")
+                        f.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.1])
 
-            C.view(True)
+                        f_aux = C_aux.addFrame(f"goal1", "world", f"shape:ssBox, size:[{ob_s*.6}, {ob_s*.6}, 0.2, 0.01], color:[0 0 1], contact:0, logical{'{goal}'}")
+                        f_aux.setRelativePosition([sx+ob_s*c, sy-ob_s*r, 0.1])
+
+            #C.view(True)
+            #C_aux.view(True)
+
+            #Save the config str as a .g file in the ry_config folder, in a unique subfolder
+            new_C = C.write()
+            new_C_aux = C_aux.write()
+            os.makedirs(f"ry_config/case_run_id_{fn}/pcg-{i}", exist_ok=True)
+            with open(f"ry_config/case_run_id_{fn}/pcg-{i}/pcg-{i}.g", "w") as f:
+                f.write(new_C)
+            with open(f"ry_config/case_run_id_{fn}/pcg-{i}/pcg-{i}-aux.g", "w") as f:
+                f.write(new_C_aux)
+
+            
+
 if __name__ == "__main__":
     main()
